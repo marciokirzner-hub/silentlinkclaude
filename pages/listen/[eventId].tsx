@@ -8,12 +8,21 @@ import {
   CSSProperties,
 } from "react";
 
-const ICE = {
-  iceServers: [
+function buildIceConfig(): RTCConfiguration {
+  const servers: RTCIceServer[] = [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
-  ],
-};
+  ];
+  if (process.env.NEXT_PUBLIC_TURN_URL) {
+    servers.push({
+      urls: process.env.NEXT_PUBLIC_TURN_URL,
+      username: process.env.NEXT_PUBLIC_TURN_USERNAME,
+      credential: process.env.NEXT_PUBLIC_TURN_CREDENTIAL,
+    });
+  }
+  return { iceServers: servers };
+}
+const ICE = buildIceConfig();
 
 type Status =
   | "idle"
@@ -52,6 +61,14 @@ export default function ListenPage() {
   const [eventName, setEventName] = useState("Silent Party");
   const [hasJoined, setHasJoined] = useState(false);
   const [volume, setVolume] = useState(1);
+  const [audioBlocked, setAudioBlocked] = useState(false); // iOS autoplay blocked
+
+  // Mirror status in a ref so WS/PC callbacks never read stale closure values
+  const statusRef = useRef<Status>("idle");
+  const setStatusSynced = useCallback((s: Status) => {
+    statusRef.current = s;
+    setStatus(s);
+  }, []);
 
   const wsRef = useRef<WebSocket | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
@@ -108,7 +125,8 @@ export default function ListenPage() {
     closeWs();
     closePc();
 
-    setStatus("connecting");
+    setStatusSynced("connecting");
+    setAudioBlocked(false);
 
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${window.location.host}/ws`);
@@ -131,11 +149,7 @@ export default function ListenPage() {
         case "listener-joined": {
           listenerIdRef.current = msg.listenerId as string;
           if (msg.eventName) setEventName(msg.eventName as string);
-          if (msg.organizerActive) {
-            setStatus("negotiating");
-          } else {
-            setStatus("waiting_organizer");
-          }
+          setStatusSynced(msg.organizerActive ? "negotiating" : "waiting_organizer");
           break;
         }
 
@@ -143,13 +157,14 @@ export default function ListenPage() {
         case "organizer-disconnected": {
           closePc();
           if (audioRef.current) audioRef.current.srcObject = null;
-          setStatus("waiting_organizer");
+          setAudioBlocked(false);
+          setStatusSynced("waiting_organizer");
           break;
         }
 
         // ── received WebRTC offer ──────────────────────────────────────
         case "offer": {
-          setStatus("negotiating");
+          setStatusSynced("negotiating");
           const eid2 = eventIdRef.current;
 
           closePc();
@@ -158,13 +173,19 @@ export default function ListenPage() {
           iceBufRef.current = [];
 
           pc.ontrack = ({ streams }) => {
-            if (streams[0] && audioRef.current) {
-              audioRef.current.srcObject = streams[0];
-              audioRef.current.play().catch(() => {
-                // Autoplay blocked — user interaction needed (handled by join btn)
+            if (!streams[0] || !audioRef.current) return;
+            audioRef.current.srcObject = streams[0];
+            audioRef.current
+              .play()
+              .then(() => {
+                setAudioBlocked(false);
+                setStatusSynced("live");
+              })
+              .catch(() => {
+                // iOS/Safari blocked autoplay — show tap-to-play overlay
+                setAudioBlocked(true);
+                setStatusSynced("live");
               });
-              setStatus("live");
-            }
           };
 
           pc.onicecandidate = ({ candidate }) => {
@@ -179,18 +200,28 @@ export default function ListenPage() {
               );
           };
 
-          pc.onconnectionstatechange = () => {
-            if (pc.connectionState === "failed") {
-              setStatus("reconnecting");
+          // iceConnectionState fires faster than connectionState for failures
+          pc.oniceconnectionstatechange = () => {
+            if (pc.iceConnectionState === "failed") {
+              setStatusSynced("reconnecting");
               if (audioRef.current) audioRef.current.srcObject = null;
+              setAudioBlocked(false);
               closePc();
-              reconnectTimerRef.current = setTimeout(() => connect(), 3000);
+              reconnectTimerRef.current = setTimeout(connect, 2000);
             }
-            if (pc.connectionState === "disconnected") {
-              setStatus("reconnecting");
+            if (pc.iceConnectionState === "disconnected") {
+              setStatusSynced("reconnecting");
             }
-            if (pc.connectionState === "connected") {
-              setStatus("live");
+          };
+
+          pc.onconnectionstatechange = () => {
+            if (pc.connectionState === "connected") setStatusSynced("live");
+            if (pc.connectionState === "failed") {
+              setStatusSynced("reconnecting");
+              if (audioRef.current) audioRef.current.srcObject = null;
+              setAudioBlocked(false);
+              closePc();
+              reconnectTimerRef.current = setTimeout(connect, 2000);
             }
           };
 
@@ -199,7 +230,7 @@ export default function ListenPage() {
               new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit)
             );
 
-            // Flush buffered ICE candidates
+            // Flush ICE candidates buffered before remote desc was ready
             for (const c of iceBufRef.current) {
               await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
             }
@@ -212,7 +243,7 @@ export default function ListenPage() {
             );
           } catch (err) {
             console.error("Offer handling failed:", err);
-            setStatus("error");
+            setStatusSynced("error");
           }
           break;
         }
@@ -231,14 +262,15 @@ export default function ListenPage() {
       }
     };
 
+    // Use statusRef here — closure would capture stale status value otherwise
     ws.onclose = () => {
-      if (status !== "idle") {
-        setStatus("reconnecting");
-        reconnectTimerRef.current = setTimeout(() => connect(), 3000);
+      if (statusRef.current !== "idle") {
+        setStatusSynced("reconnecting");
+        reconnectTimerRef.current = setTimeout(connect, 3000);
       }
     };
 
-    ws.onerror = () => setStatus("error");
+    ws.onerror = () => setStatusSynced("error");
   }, [closeWs, closePc]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── join button handler ─────────────────────────────────────────────────
@@ -252,8 +284,9 @@ export default function ListenPage() {
     closePc();
     if (audioRef.current) audioRef.current.srcObject = null;
     setHasJoined(false);
-    setStatus("idle");
-  }, [closeWs, closePc]);
+    setAudioBlocked(false);
+    setStatusSynced("idle");
+  }, [closeWs, closePc, setStatusSynced]);
 
   // ── cleanup on unmount ──────────────────────────────────────────────────
   useEffect(() => {
@@ -319,6 +352,18 @@ export default function ListenPage() {
                   />
                 ))}
               </div>
+
+              {/* iOS autoplay blocked — need one more tap */}
+              {audioBlocked && (
+                <button
+                  style={s.tapBtn}
+                  onClick={() => {
+                    audioRef.current?.play().then(() => setAudioBlocked(false));
+                  }}
+                >
+                  Tap to enable audio
+                </button>
+              )}
 
               {/* Volume control */}
               <div style={s.volumeWrap}>
@@ -441,6 +486,17 @@ const s: Record<string, CSSProperties> = {
     accentColor: "var(--green)",
     cursor: "pointer",
     height: 4,
+  },
+  tapBtn: {
+    background: "var(--purple)",
+    color: "#fff",
+    border: "none",
+    padding: "14px 32px",
+    borderRadius: 100,
+    fontSize: 16,
+    fontWeight: 700,
+    cursor: "pointer",
+    animation: "pulse 1.2s ease-in-out infinite",
   },
   leaveBtn: {
     background: "transparent",

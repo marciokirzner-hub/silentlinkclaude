@@ -75,9 +75,11 @@ app.prepare().then(() => {
           const room = getOrCreateRoom(eventId, msg.eventName || "Silent Party");
           room.organizer = ws;
           if (msg.eventName) room.eventName = msg.eventName;
+          // Include existing listener IDs so organizer can re-offer after reconnect
           safeSend(ws, {
             type: "organizer-joined",
             listenerCount: room.listeners.size,
+            listenerIds: Array.from(room.listeners.keys()),
           });
           break;
         }

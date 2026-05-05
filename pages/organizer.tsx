@@ -8,12 +8,22 @@ import {
   CSSProperties,
 } from "react";
 
-const ICE = {
-  iceServers: [
+function buildIceConfig(): RTCConfiguration {
+  const servers: RTCIceServer[] = [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
-  ],
-};
+  ];
+  // TURN server — set NEXT_PUBLIC_TURN_URL / _USERNAME / _CREDENTIAL in env
+  if (process.env.NEXT_PUBLIC_TURN_URL) {
+    servers.push({
+      urls: process.env.NEXT_PUBLIC_TURN_URL,
+      username: process.env.NEXT_PUBLIC_TURN_USERNAME,
+      credential: process.env.NEXT_PUBLIC_TURN_CREDENTIAL,
+    });
+  }
+  return { iceServers: servers };
+}
+const ICE = buildIceConfig();
 
 function makeEventId() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -138,9 +148,19 @@ export default function OrganizerPage() {
       }
 
       switch (msg.type) {
-        case "organizer-joined":
+        case "organizer-joined": {
           setListenerCount((msg.listenerCount as number) || 0);
+          // Re-offer to any listeners already waiting (e.g. after organizer WS reconnect)
+          const existingIds = (msg.listenerIds as string[]) || [];
+          if (streamRef.current) {
+            for (const lid of existingIds) await createPeer(lid);
+          } else {
+            for (const lid of existingIds) {
+              if (!pendingRef.current.includes(lid)) pendingRef.current.push(lid);
+            }
+          }
           break;
+        }
 
         case "listener-connected": {
           const lid = msg.listenerId as string;
