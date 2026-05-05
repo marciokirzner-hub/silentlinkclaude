@@ -84,9 +84,22 @@ export default function OrganizerPage() {
       const pc = new RTCPeerConnection(ICE);
       peersRef.current.set(lid, pc);
 
+      const senders: RTCRtpSender[] = [];
       streamRef.current.getAudioTracks().forEach((track) => {
-        pc.addTrack(track, streamRef.current!);
+        senders.push(pc.addTrack(track, streamRef.current!));
       });
+
+      // Bump Opus to 128 kbps stereo, disable DTX (which degrades music during quiet passages)
+      pc.onnegotiationneeded = async () => {
+        for (const sender of senders) {
+          const params = sender.getParameters();
+          if (!params.encodings?.length) params.encodings = [{}];
+          params.encodings[0].maxBitrate = 128_000;
+          // @ts-expect-error — non-standard but supported in Chrome/Firefox/Safari
+          params.encodings[0].dtx = false;
+          await sender.setParameters(params).catch(() => {});
+        }
+      };
 
       pc.onicecandidate = ({ candidate }) => {
         if (!candidate) return;
@@ -274,6 +287,7 @@ export default function OrganizerPage() {
           noiseSuppression: false,
           autoGainControl: false,
           sampleRate: 48000,
+          channelCount: 2,
         },
         video: false,
       };
