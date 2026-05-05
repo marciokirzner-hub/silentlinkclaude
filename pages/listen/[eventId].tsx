@@ -77,21 +77,28 @@ export default function ListenPage() {
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const iceBufRef = useRef<RTCIceCandidateInit[]>([]); // buffer before remote desc
   const eventIdRef = useRef<string>("");
+  // Stable ref to connect() so effects declared before connect can call it
+  const connectRef = useRef<() => void>(() => {});
 
   // Keep eventIdRef in sync
   useEffect(() => {
     if (eventId) eventIdRef.current = eventId;
   }, [eventId]);
 
-  // Create audio element once
+  // Create audio element once — must be appended to DOM for iOS background audio
   useEffect(() => {
     const el = document.createElement("audio");
     el.autoplay = true;
     el.setAttribute("playsinline", "true");
+    el.setAttribute("x-webkit-airplay", "allow");
     el.volume = volume;
+    el.style.cssText = "position:absolute;width:0;height:0;opacity:0;pointer-events:none;";
+    document.body.appendChild(el);
     audioRef.current = el;
     return () => {
+      el.pause();
       el.srcObject = null;
+      if (document.body.contains(el)) document.body.removeChild(el);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -99,6 +106,60 @@ export default function ListenPage() {
   useEffect(() => {
     if (audioRef.current) audioRef.current.volume = volume;
   }, [volume]);
+
+  // ── Media Session: registers stream as background audio with the OS ────────
+  const setupMediaSession = useCallback((name: string) => {
+    if (!("mediaSession" in navigator)) return;
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: name,
+      artist: "SilentLink Live",
+    });
+    // Keep audio alive when lock-screen controls are used
+    navigator.mediaSession.setActionHandler("play", () => {
+      audioRef.current?.play().catch(() => {});
+    });
+    navigator.mediaSession.setActionHandler("pause", () => {
+      // Swallow pause — silent disco should keep playing
+      audioRef.current?.play().catch(() => {});
+    });
+  }, []);
+
+  // ── Resume audio / reconnect when screen unlocks or tab comes back ──────
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      const audio = audioRef.current;
+      const pc = pcRef.current;
+      // Resume audio if iOS paused it while screen was locked
+      if (audio?.srcObject && audio.paused && statusRef.current === "live") {
+        audio.play().catch(() => setAudioBlocked(true));
+      }
+      // Reconnect if the WebRTC connection died in the background
+      if (pc && (pc.connectionState === "failed" || pc.connectionState === "disconnected")) {
+        setStatusSynced("reconnecting");
+        connectRef.current();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [setStatusSynced]);
+
+  // ── Auto-resume if the OS pauses the audio element (screen lock / call) ──
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const onPause = () => {
+      if (statusRef.current !== "live") return;
+      // Small delay so we don't fight an intentional pause mid-gesture
+      setTimeout(() => {
+        if (audio.paused && statusRef.current === "live") {
+          audio.play().catch(() => {});
+        }
+      }, 400);
+    };
+    audio.addEventListener("pause", onPause);
+    return () => audio.removeEventListener("pause", onPause);
+  }, []);
 
   // ── cleanup helpers ─────────────────────────────────────────────────────
   const closePc = useCallback(() => {
@@ -180,6 +241,10 @@ export default function ListenPage() {
               .then(() => {
                 setAudioBlocked(false);
                 setStatusSynced("live");
+                setupMediaSession(eventName);
+                if ("mediaSession" in navigator) {
+                  navigator.mediaSession.playbackState = "playing";
+                }
               })
               .catch(() => {
                 // iOS/Safari blocked autoplay — show tap-to-play overlay
@@ -273,6 +338,9 @@ export default function ListenPage() {
     ws.onerror = () => setStatusSynced("error");
   }, [closeWs, closePc]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Keep ref in sync so effects declared before connect can call it
+  useEffect(() => { connectRef.current = connect; }, [connect]);
+
   // ── join button handler ─────────────────────────────────────────────────
   const handleJoin = useCallback(() => {
     setHasJoined(true);
@@ -358,7 +426,13 @@ export default function ListenPage() {
                 <button
                   style={s.tapBtn}
                   onClick={() => {
-                    audioRef.current?.play().then(() => setAudioBlocked(false));
+                    audioRef.current?.play().then(() => {
+                      setAudioBlocked(false);
+                      setupMediaSession(eventName);
+                      if ("mediaSession" in navigator) {
+                        navigator.mediaSession.playbackState = "playing";
+                      }
+                    });
                   }}
                 >
                   Tap to enable audio
